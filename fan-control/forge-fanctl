@@ -1,0 +1,82 @@
+#!/bin/bash
+# forge-fanctl - temperature-driven PWM control for hosts fancontrol cannot address.
+#
+# Why this exists instead of fancontrol:
+#   Profile B  f71882fg exposes attributes on the platform device, not under hwmon/hwmonN/,
+#        which is the only addressing fancontrol understands.
+#   Profile A  dell_smm exposes WRITE-ONLY pwm (reads return -ENODATA); fancontrol must read.
+#
+# Paths may be given literally, or as @hwmonname/attr which is resolved by hwmon
+# 'name' each cycle so that hwmonN renumbering across reboots cannot mispoint us.
+#
+# Fails safe: on any exit fans are driven to SAFE_PWM.
+set -u
+CONF=${1:-/etc/forge-fanctl.conf}
+. "$CONF"
+
+: "${INTERVAL:=10}"
+: "${SAFE_PWM:=255}"
+
+resolve() {
+    case "$1" in
+        @*) local nm n attr d dn
+            # NB: these must be separate assignments. In a single "local a=.. b=$a"
+            # bash does not expose the earlier assignment to the later expansion,
+            # which silently yielded an empty name and matched an unnamed hwmon.
+            nm=${1#@}; n=${nm%%/*}; attr=${nm#*/}
+            for d in /sys/class/hwmon/hwmon*; do
+                dn=$(cat "$d/name" 2>/dev/null)
+                # an unnamed hwmon must never match an empty parse
+                [ -z "$dn" ] && continue
+                if [ "$dn" = "$n" ]; then echo "$d/$attr"; return; fi
+            done
+            echo "" ;;
+        *)  echo "$1" ;;
+    esac
+}
+
+write_all() {
+    local val=$1 spec f
+    for spec in $PWM_SPECS; do
+        f=$(resolve "${spec%%:*}")
+        [ -n "$f" ] && echo "$val" > "$f" 2>/dev/null
+    done
+    return 0
+}
+trap 'write_all "$SAFE_PWM"; exit 0' EXIT INT TERM
+
+[ -n "${INIT_CMD:-}" ] && eval "$INIT_CMD"
+
+# Put every controlled channel into manual mode. Done here rather than via
+# INIT_CMD so that configs stay free of shell quoting that gets expanded at
+# source time. Chips with no *_enable node (e.g. dell_smm) simply skip.
+ensure_manual() {
+    local spec f
+    for spec in $PWM_SPECS; do
+        f=$(resolve "${spec%%:*}")
+        [ -n "$f" ] && [ -e "${f}_enable" ] && echo 1 > "${f}_enable" 2>/dev/null
+    done
+    return 0
+}
+ensure_manual
+
+while true; do
+    ensure_manual
+    tf=$(resolve "$TEMP_FILE")
+    # Unreadable sensor must mean "assume hot", never "assume cold".
+    raw=$(cat "$tf" 2>/dev/null || echo 95000)
+    [ -z "$raw" ] && raw=95000
+    t=$(( raw / 1000 ))
+
+    for spec in $PWM_SPECS; do
+        rest=${spec#*:}; lo=${rest%%:*}; hi=${rest##*:}
+        f=$(resolve "${spec%%:*}")
+        [ -z "$f" ] && continue
+        if   [ "$t" -le "$MINTEMP" ]; then v=$lo
+        elif [ "$t" -ge "$MAXTEMP" ]; then v=$hi
+        else v=$(( lo + (t - MINTEMP) * (hi - lo) / (MAXTEMP - MINTEMP) ))
+        fi
+        echo "$v" > "$f" 2>/dev/null
+    done
+    sleep "$INTERVAL"
+done

@@ -1,0 +1,20 @@
+[Unit]
+Description=Forge GPU stats collector (nvidia-smi → RRD)
+Documentation=https://github.com/forgenord/forge/tree/main/infra/proxmox-monitoring
+After=network.target rrdcached.service
+Wants=rrdcached.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/forge-gpu-collector
+Restart=always
+RestartSec=10
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/rrdcached/db /var/run
+
+[Install]
+WantedBy=multi-user.target

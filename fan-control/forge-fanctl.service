@@ -1,0 +1,12 @@
+[Unit]
+Description=Forge fan control (hosts fancontrol cannot address)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/forge-fanctl /etc/forge-fanctl.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+# Forge GPU collector: polls nvidia-smi every 10s and updates a custom RRD
+# at /var/lib/rrdcached/db/forge-gpu-9.0/<hostname>. The RRD layout mirrors
+# Proxmox's own pve-node-9.0 schema closely enough that
+# PVE::RRD::create_rrd_data can read it transparently via the new
+# /api2/json/nodes/{node}/gpu_rrddata endpoint.
+#
+# Designed to be the only daemon writing to its RRD. Restarts cheaply via
+# Restart=always in the systemd unit.
+
+use strict;
+use warnings;
+use RRDs;
+use POSIX qw(strftime);
+
+my $hostname = `hostname`;
+chomp $hostname;
+my $rrddir = "/var/lib/rrdcached/db/forge-gpu-9.0";
+my $rrdfile = "$rrddir/$hostname";
+my $socket = "/var/run/rrdcached.sock";
+
+unless (-d $rrddir) {
+    mkdir($rrddir, 0755) or die "mkdir $rrddir: $!";
+}
+
+# RRA structure matches PVE9 setup in PVE/RRD.pm (60s base step,
+# AVERAGE+MAX consolidation, covering hour/day/week/month/year/decade).
+unless (-e $rrdfile) {
+    RRDs::create(
+        $rrdfile,
+        "--step" => "60",
+        "DS:gpu_usage:GAUGE:120:0:100",
+        "DS:gpu_mem_used:GAUGE:120:0:U",
+        "DS:gpu_mem_total:GAUGE:120:0:U",
+        "DS:gpu_temp:GAUGE:120:0:U",
+        # Match PVE9 setup: hour/day = 60s step; week/month = 1800s step;
+        # year = 21600s step; decade = 604800s step.
+        "RRA:AVERAGE:0.5:1:1440",         # 60s step  × 1440 → 24h
+        "RRA:AVERAGE:0.5:30:1440",        # 1800s step × 1440 → 30 days
+        "RRA:AVERAGE:0.5:360:1440",       # 21600s step × 1440 → 360 days
+        "RRA:AVERAGE:0.5:10080:570",      # 604800s step × 570 → 10 years
+        "RRA:MAX:0.5:1:1440",
+        "RRA:MAX:0.5:30:1440",
+        "RRA:MAX:0.5:360:1440",
+        "RRA:MAX:0.5:10080:570",
+    );
+    my $err = RRDs::error;
+    die "RRD create failed: $err\n" if $err;
+    warn "[forge-gpu-collector] created $rrdfile\n";
+}
+
+sub probe_nvidia {
+    my $raw = qx{nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null};
+    return undef unless defined $raw && length $raw;
+    my ($line) = split /\n/, $raw;
+    return undef unless defined $line;
+    my @parts = split /\s*,\s*/, $line;
+    return undef unless @parts == 4;
+    for (@parts) { s/^\s+|\s+$//g; }
+    return undef unless $parts[0] =~ /^[0-9.]+$/;
+    return {
+        usage     => $parts[0] + 0,
+        mem_used  => ($parts[1] + 0) * 1024 * 1024,
+        mem_total => ($parts[2] + 0) * 1024 * 1024,
+        temp      => $parts[3] + 0,
+    };
+}
+
+$SIG{TERM} = sub { exit 0 };
+$SIG{INT}  = sub { exit 0 };
+
+while (1) {
+    my $sample = probe_nvidia();
+    if ($sample) {
+        my @args = ("N:$sample->{usage}:$sample->{mem_used}:$sample->{mem_total}:$sample->{temp}");
+        push @args, "--daemon" => "unix:$socket" if -S $socket;
+        RRDs::update($rrdfile, @args);
+        my $err = RRDs::error;
+        if ($err) {
+            warn "[forge-gpu-collector] update error: $err\n";
+        }
+    }
+    sleep 10;
+}

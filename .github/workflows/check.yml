@@ -1,0 +1,16 @@
+name: Static checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m py_compile monitoring/apply-patches.py monitoring/forge-pve-sensors
+      - run: bash -n monitoring/apply-patches.sh monitoring/deploy.sh monitoring/revert-patches.sh fan-control/forge-fanctl

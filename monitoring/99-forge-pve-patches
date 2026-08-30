@@ -1,0 +1,6 @@
+// Re-apply forge Proxmox monitoring patches after pve-manager /
+// proxmox-widget-toolkit upgrades. The patcher is idempotent and detects
+// whether the host has a GPU by checking for the forge-gpu-collector unit.
+DPkg::Post-Invoke {
+    "if [ -x /usr/local/sbin/forge-apply-pve-patches ] && [ -f /usr/share/pve-manager/js/pvemanagerlib.js ]; then if systemctl list-unit-files forge-gpu-collector.service 2>/dev/null | grep -q forge-gpu-collector; then /usr/local/sbin/forge-apply-pve-patches --with-gpu || true; else /usr/local/sbin/forge-apply-pve-patches || true; fi; fi";
+};

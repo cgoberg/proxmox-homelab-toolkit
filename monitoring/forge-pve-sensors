@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Forge PVE sensor probe.
+
+Reads system sensors (lm-sensors, smartctl, nvidia-smi) and emits a flat JSON
+blob consumable by the patched Proxmox node-status endpoint. Designed to be
+fast (<1s wall time on every host) and never crash — any failed probe is
+silently omitted from the output.
+
+Output keys (all optional, all numeric):
+  cpu_temp_c          Tdie/coretemp Package id 0
+  gpu_temp_c          amdgpu/radeon/nouveau/i915 edge temp, OR nvidia-smi
+  nvme_temp_c         first nvme-pciXXXX Composite temp
+  sata_temp_c         /dev/sda smartctl temperature.current
+  mobo_temp_c         nct67XX SYSTIN, else acpitz thermal zone (OEM boards)
+  gpu_usage_pct       nvidia-smi utilization.gpu
+  gpu_mem_used_mib    nvidia-smi memory.used
+  gpu_mem_total_mib   nvidia-smi memory.total
+  gpu_mem_used_bytes  derived (for ExtJS pmxInfoWidget bar rendering)
+  gpu_mem_total_bytes derived
+  gpu_usage_frac      gpu_usage_pct / 100 (for ExtJS bar rendering, 0..1)
+
+Exit code is always 0 on success (even with empty output).
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+# pvedaemon runs with NO PATH set at all. With PATH unset, execvp() falls back
+# to a built-in default of roughly "/bin:/usr/bin" -- which contains sensors
+# (/usr/bin/sensors) but NOT smartctl (/usr/sbin/smartctl). That is why
+# cpu/mobo temps worked while sata_temp_c silently vanished from the API, yet
+# everything looked fine when the helper was run by hand from a root shell.
+#
+# Set an absolute PATH rather than appending: appending to an empty string
+# yields ":/usr/sbin:/sbin", which would find smartctl but then lose sensors.
+os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def sh(cmd, timeout=3):
+    try:
+        return subprocess.check_output(
+            cmd, timeout=timeout, stderr=subprocess.DEVNULL
+        ).decode()
+    except Exception:
+        return None
+
+
+def parse_sensors():
+    raw = sh(["sensors", "-j"])
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        try:
+            return json.loads(raw.replace(",\n}", "\n}"))
+        except Exception:
+            return {}
+
+
+def deep_get(obj, *path):
+    cur = obj
+    for part in path:
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur if isinstance(cur, (int, float)) else None
+
+
+def find_chip(sensors_data, *substrs):
+    for chip_name, chip_val in sensors_data.items():
+        low = chip_name.lower()
+        if any(s in low for s in substrs):
+            return chip_name, chip_val
+    return None, None
+
+
+def parse_smartctl(device):
+    if not os.path.exists(device):
+        return None
+    raw = sh(["smartctl", "-A", "-j", device])
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        cur = data.get("temperature", {}).get("current")
+        if isinstance(cur, (int, float)):
+            return float(cur)
+    except Exception:
+        pass
+    return None
+
+
+def parse_nvidia():
+    raw = sh(
+        [
+            "nvidia-smi",
+            "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    if not raw:
+        return None
+    line = raw.strip().splitlines()[0]
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        return {
+            "gpu_temp_c": float(parts[0]),
+            "gpu_usage_pct": float(parts[1]),
+            "gpu_mem_used_mib": float(parts[2]),
+            "gpu_mem_total_mib": float(parts[3]),
+        }
+    except Exception:
+        return None
+
+
+def main():
+    out = {}
+    sensors_data = parse_sensors()
+
+    # CPU temp: prefer AMD Tdie, fall back to Tctl, then Intel coretemp Package.
+    cpu_temp = None
+    _, chip = find_chip(sensors_data, "k10temp", "zenpower")
+    if chip:
+        cpu_temp = (
+            deep_get(chip, "Tdie", "temp2_input")
+            or deep_get(chip, "Tdie", "temp1_input")
+            or deep_get(chip, "Tctl", "temp1_input")
+            or deep_get(chip, "Tctl", "temp2_input")
+        )
+    if cpu_temp is None:
+        _, chip = find_chip(sensors_data, "coretemp")
+        if chip:
+            cpu_temp = deep_get(chip, "Package id 0", "temp1_input")
+            if cpu_temp is None:
+                # No Package id (some older Intel CPUs only report per-core);
+                # fall back to Core 0.
+                cpu_temp = deep_get(chip, "Core 0", "temp2_input")
+    if cpu_temp is not None:
+        out["cpu_temp_c"] = round(cpu_temp, 1)
+
+    # GPU temp from sensors (AMD/nouveau/Intel) - may be overridden by nvidia-smi.
+    gpu_temp = None
+    for chip_substr in ("amdgpu", "radeon", "nouveau", "i915"):
+        _, chip = find_chip(sensors_data, chip_substr)
+        if not chip:
+            continue
+        for key in ("edge", "junction", "GPU core", "temp1"):
+            for input_name in ("temp1_input", "temp2_input"):
+                val = deep_get(chip, key, input_name)
+                if val is not None:
+                    gpu_temp = val
+                    break
+            if gpu_temp is not None:
+                break
+        if gpu_temp is not None:
+            break
+    if gpu_temp is not None:
+        out["gpu_temp_c"] = round(gpu_temp, 1)
+
+    # NVMe temp: first nvme-pciXXXX/Composite found.
+    for chip_name, chip in sensors_data.items():
+        if chip_name.startswith("nvme-"):
+            val = deep_get(chip, "Composite", "temp1_input")
+            if val is not None:
+                out["nvme_temp_c"] = round(val, 1)
+                break
+
+    # Mainboard temp: nct67XX SYSTIN (chassis ambient).
+    _, chip = find_chip(sensors_data, "nct6", "it87", "f71889")
+    if chip:
+        for key, sub in (
+            ("SYSTIN", "temp1_input"),
+            ("temp1", "temp1_input"),
+            ("temp2", "temp2_input"),
+        ):
+            val = deep_get(chip, key, sub)
+            if val is not None and -50 < val < 150:
+                out["mobo_temp_c"] = round(val, 1)
+                break
+
+    # Mainboard fallback: ACPI thermal zone. OEM boards (e.g. Dell OptiPlex)
+    # expose no Super-I/O hwmon at all, so acpitz is the only system-level
+    # ambient reading available. Only used when no Super-I/O chip was found.
+    if "mobo_temp_c" not in out:
+        _, chip = find_chip(sensors_data, "acpitz")
+        if chip:
+            for key, sub in (("temp1", "temp1_input"), ("temp2", "temp2_input")):
+                val = deep_get(chip, key, sub)
+                if val is not None and -50 < val < 150:
+                    out["mobo_temp_c"] = round(val, 1)
+                    break
+
+    # SATA SSD via smartctl.
+    sata = parse_smartctl("/dev/sda")
+    if sata is not None:
+        out["sata_temp_c"] = round(sata, 1)
+
+    # NVIDIA GPU stats.
+    nvidia = parse_nvidia()
+    if nvidia:
+        # nvidia-smi temp is authoritative when present.
+        out["gpu_temp_c"] = round(nvidia["gpu_temp_c"], 1)
+        out["gpu_usage_pct"] = round(nvidia["gpu_usage_pct"], 1)
+        out["gpu_usage_frac"] = round(nvidia["gpu_usage_pct"] / 100.0, 4)
+        out["gpu_mem_used_mib"] = round(nvidia["gpu_mem_used_mib"], 1)
+        out["gpu_mem_total_mib"] = round(nvidia["gpu_mem_total_mib"], 1)
+        # MiB → bytes for ExtJS Proxmox.Utils.render_node_size_usage compatibility.
+        out["gpu_mem_used_bytes"] = int(nvidia["gpu_mem_used_mib"] * 1024 * 1024)
+        out["gpu_mem_total_bytes"] = int(nvidia["gpu_mem_total_mib"] * 1024 * 1024)
+
+    sys.stdout.write(json.dumps(out, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        sys.stdout.write("{}")
