@@ -1,9 +1,8 @@
 # Forge Proxmox monitoring patches
 
-Restores the CPU/GPU/NVMe/disk temperature panel to the Proxmox VE 9 node
-Summary view (lost when the cluster was upgraded from PVE 7) and, on hosts
-with an NVIDIA GPU, adds GPU usage / VRAM / GPU temperature charts under the
-existing CPU/Memory charts.
+Adds CPU/GPU/NVMe/disk temperatures to the Proxmox VE 9 node Summary view and,
+on hosts with an NVIDIA GPU, adds GPU usage / VRAM / GPU temperature charts
+under the existing CPU/Memory charts.
 
 ## What it does
 
