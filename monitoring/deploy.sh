@@ -13,10 +13,18 @@ fi
 
 HOST="$1"
 shift
+if [[ "$HOST" == -* ]]; then
+    echo "Host must not begin with '-'" >&2
+    exit 2
+fi
 WITH_GPU=""
 if [[ $# -gt 0 && "$1" == "--with-gpu" ]]; then
     WITH_GPU="--with-gpu"
     shift
+fi
+if [[ $# -gt 0 ]]; then
+    echo "Unexpected argument: $1" >&2
+    exit 2
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -25,7 +33,7 @@ REMOTE_DIR="/opt/forge-proxmox-monitoring"
 echo "[deploy] target: $HOST  gpu=${WITH_GPU:-no}"
 
 # Make sure target dir exists, then rsync source files there.
-ssh "$HOST" "mkdir -p $REMOTE_DIR/patches"
+ssh -- "$HOST" "mkdir -p $REMOTE_DIR/patches"
 rsync -a --delete \
     "$HERE/forge-pve-sensors" \
     "$HERE/forge-gpu-collector" \
@@ -38,7 +46,7 @@ rsync -a --delete \
 rsync -a --delete "$HERE/patches/" "$HOST:$REMOTE_DIR/patches/"
 
 # Install helper script + collector + apt hook on the remote, then patch.
-ssh "$HOST" bash -s -- "$WITH_GPU" <<'REMOTE'
+ssh -- "$HOST" bash -s -- "$WITH_GPU" <<'REMOTE'
 set -euo pipefail
 WITH_GPU="${1:-}"
 

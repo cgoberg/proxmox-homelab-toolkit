@@ -12,10 +12,41 @@
 # Fails safe: on any exit fans are driven to SAFE_PWM.
 set -u
 CONF=${1:-/etc/forge-fanctl.conf}
-. "$CONF"
+
+# Parse only the data fields this controller understands. The service runs as
+# root, so sourcing a configuration file or evaluating a command from it would
+# turn a writable config into arbitrary code execution.
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key=${line%%=*}
+    value=${line#*=}
+    [ "$key" != "$line" ] || { echo "invalid config line: $line" >&2; exit 2; }
+    value=${value#\"}; value=${value%\"}
+    case "$key" in
+        TEMP_FILE|PWM_SPECS|MINTEMP|MAXTEMP|INTERVAL|SAFE_PWM)
+            printf -v "$key" '%s' "$value" ;;
+        *) echo "unsupported config key: $key" >&2; exit 2 ;;
+    esac
+done < "$CONF"
 
 : "${INTERVAL:=10}"
 : "${SAFE_PWM:=255}"
+
+for number_name in INTERVAL SAFE_PWM MINTEMP MAXTEMP; do
+    number_value=${!number_name:-}
+    [[ "$number_value" =~ ^[0-9]+$ ]] || {
+        echo "$number_name must be an unsigned integer" >&2
+        exit 2
+    }
+done
+(( INTERVAL > 0, SAFE_PWM <= 255, MINTEMP < MAXTEMP )) || {
+    echo "unsafe numeric limits in fan-control config" >&2
+    exit 2
+}
+[[ -n "${TEMP_FILE:-}" && -n "${PWM_SPECS:-}" ]] || {
+    echo "TEMP_FILE and PWM_SPECS are required" >&2
+    exit 2
+}
 
 resolve() {
     case "$1" in
@@ -24,6 +55,8 @@ resolve() {
             # bash does not expose the earlier assignment to the later expansion,
             # which silently yielded an empty name and matched an unnamed hwmon.
             nm=${1#@}; n=${nm%%/*}; attr=${nm#*/}
+            [[ "$n" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo ""; return; }
+            [[ "$attr" =~ ^(pwm[0-9]+|temp[0-9]+_input)$ ]] || { echo ""; return; }
             for d in /sys/class/hwmon/hwmon*; do
                 dn=$(cat "$d/name" 2>/dev/null)
                 # an unnamed hwmon must never match an empty parse
@@ -31,8 +64,30 @@ resolve() {
                 if [ "$dn" = "$n" ]; then echo "$d/$attr"; return; fi
             done
             echo "" ;;
-        *)  echo "$1" ;;
+        *)
+            [[ "$1" =~ ^/sys/devices/[A-Za-z0-9_./:-]+/(pwm[0-9]+|temp[0-9]+_input)$ ]] \
+                && echo "$1" || echo "" ;;
     esac
+}
+
+for spec in $PWM_SPECS; do
+    rest=${spec#*:}; lo=${rest%%:*}; hi=${rest##*:}
+    [[ "$spec" == *:*:* && "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || {
+        echo "invalid PWM specification" >&2
+        exit 2
+    }
+    (( lo >= 0, lo <= hi, hi <= 255 )) || {
+        echo "PWM limits must satisfy 0 <= minimum <= maximum <= 255" >&2
+        exit 2
+    }
+    [ -n "$(resolve "${spec%%:*}")" ] || {
+        echo "PWM target is not an allowed sysfs path" >&2
+        exit 2
+    }
+done
+[ -n "$(resolve "$TEMP_FILE")" ] || {
+    echo "temperature target is not an allowed sysfs path" >&2
+    exit 2
 }
 
 write_all() {
@@ -45,11 +100,9 @@ write_all() {
 }
 trap 'write_all "$SAFE_PWM"; exit 0' EXIT INT TERM
 
-[ -n "${INIT_CMD:-}" ] && eval "$INIT_CMD"
-
 # Put every controlled channel into manual mode. Done here rather than via
-# INIT_CMD so that configs stay free of shell quoting that gets expanded at
-# source time. Chips with no *_enable node (e.g. dell_smm) simply skip.
+# config commands so configuration stays declarative. Chips with no *_enable
+# node (e.g. dell_smm) simply skip.
 ensure_manual() {
     local spec f
     for spec in $PWM_SPECS; do
