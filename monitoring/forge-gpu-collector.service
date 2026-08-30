@@ -1,6 +1,6 @@
 [Unit]
 Description=Forge GPU stats collector (nvidia-smi → RRD)
-Documentation=https://github.com/forgenord/forge/tree/main/infra/proxmox-monitoring
+Documentation=https://github.com/cgoberg/proxmox-homelab-toolkit/tree/main/monitoring
 After=network.target rrdcached.service
 Wants=rrdcached.service
 

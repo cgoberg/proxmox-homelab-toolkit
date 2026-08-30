@@ -7,7 +7,7 @@ This repository combines:
 
 - **fan-control tooling** for hardware that Linux `fancontrol` cannot address
   correctly, plus measured example curves for four older Intel/AMD systems;
-- **monitoring patches** that restore CPU, motherboard, NVMe, SATA, and GPU
+- **monitoring patches** that add CPU, motherboard, NVMe, SATA, and GPU
   telemetry to the Proxmox VE 9 node summary, including optional NVIDIA RRD
   charts.
 
@@ -62,4 +62,3 @@ bash -n monitoring/*.sh fan-control/forge-fanctl
 MIT licensed. Issues with a new board/sensor profile are most useful when they
 include `sensors -j`, the relevant `/sys/class/hwmon` names, a measured PWM/RPM
 sweep, and load temperatures with identifying host details removed.
-
